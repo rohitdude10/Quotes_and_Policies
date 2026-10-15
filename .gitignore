@@ -1,3 +1,9 @@
 insurance.db
 __pycache__/
 *.py[cod]
+infrastructure/terraform/.terraform/
+infrastructure/terraform/*.tfstate
+infrastructure/terraform/*.tfstate.*
+infrastructure/terraform/*.tfplan
+infrastructure/terraform/terraform.tfvars
+infrastructure/terraform/crash.log

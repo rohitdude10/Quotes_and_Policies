@@ -11,7 +11,13 @@ from src.analytics import (
     bind_rate_by_day,
     overlapping_policy_customers,
 )
-from src.load_data import DataQualityError, database_connection, load_csv_data
+from src.load_data import (
+    DataQualityError,
+    database_connection,
+    get_record_as_of,
+    get_records_as_of,
+    load_csv_data,
+)
 from src.models import build_reporting_tables
 
 
@@ -282,6 +288,90 @@ class PipelineTests(unittest.TestCase):
             0,
         )
         self.assertEqual(overlapping_policy_customers(connection), 0)
+
+    def test_record_history_supports_as_of_queries_updates_and_deletions(self) -> None:
+        self._write_csv(
+            "customers.csv",
+            ["customer_id", "name", "email"],
+            [
+                {
+                    "customer_id": "C1",
+                    "name": "Customer 1",
+                    "email": "c1@example.com",
+                },
+                {
+                    "customer_id": "C2",
+                    "name": "Customer 2",
+                    "email": "c2@example.com",
+                },
+            ],
+        )
+        connection = database_connection(self.database_path)
+        self.connections.append(connection)
+        load_csv_data(connection, self.dataset_dir)
+        first_version = connection.execute(
+            """
+            SELECT valid_from FROM record_history
+            WHERE dataset = 'customers' AND record_key = 'C1' AND is_current = 1
+            """
+        ).fetchone()["valid_from"]
+        first_snapshot = get_records_as_of(connection, "customers", first_version)
+        self.assertEqual(len(first_snapshot), 2)
+        self.assertEqual(
+            get_record_as_of(connection, "customers", "C1", first_version)["name"],
+            "Customer 1",
+        )
+
+        self._write_csv(
+            "customers.csv",
+            ["customer_id", "name", "email"],
+            [
+                {
+                    "customer_id": "C1",
+                    "name": "Updated Customer",
+                    "email": "c1@example.com",
+                }
+            ],
+        )
+        load_csv_data(connection, self.dataset_dir)
+        self.assertEqual(
+            get_record_as_of(connection, "customers", "C1", first_version)["name"],
+            "Customer 1",
+        )
+        latest = connection.execute(
+            """
+            SELECT valid_from FROM record_history
+            WHERE dataset = 'customers' AND record_key = 'C1' AND is_current = 1
+            """
+        ).fetchone()["valid_from"]
+        self.assertEqual(
+            get_record_as_of(connection, "customers", "C1", latest)["name"],
+            "Updated Customer",
+        )
+        self.assertIsNone(
+            get_record_as_of(connection, "customers", "C2", latest)
+        )
+        self.assertEqual(len(get_records_as_of(connection, "customers", latest)), 1)
+        self.assertEqual(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM record_history
+                WHERE dataset = 'customers' AND record_key = 'C1'
+                """
+            ).fetchone()[0],
+            2,
+        )
+
+        load_csv_data(connection, self.dataset_dir)
+        self.assertEqual(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM record_history
+                WHERE dataset = 'customers' AND record_key = 'C1'
+                """
+            ).fetchone()[0],
+            2,
+        )
 
     def test_conflicting_duplicate_natural_keys_fail_loudly(self) -> None:
         versions_path = self.dataset_dir / "quote_versions.csv"

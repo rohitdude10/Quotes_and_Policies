@@ -8,7 +8,7 @@ import logging
 import math
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -67,6 +67,8 @@ TIMESTAMP_COLUMNS = {
     "policy_expires_at",
     "policy_terminated_at",
 }
+
+HISTORY_TABLE = "record_history"
 
 
 class DataQualityError(ValueError):
@@ -233,6 +235,167 @@ def _ensure_raw_table(
     return current
 
 
+def _history_observed_at(connection: sqlite3.Connection) -> str:
+    """Return a UTC timestamp later than every previously recorded snapshot."""
+    now = datetime.now(timezone.utc)
+    history_exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (HISTORY_TABLE,),
+    ).fetchone()
+    if history_exists is None:
+        return now.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    latest = connection.execute(
+        f"SELECT MAX(valid_from) FROM {_quote_identifier(HISTORY_TABLE)}"
+    ).fetchone()[0]
+    if latest:
+        latest_timestamp = datetime.fromisoformat(latest.replace("Z", "+00:00"))
+        if now <= latest_timestamp:
+            now = latest_timestamp + timedelta(microseconds=1)
+    return now.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _record_snapshot_history(
+    connection: sqlite3.Connection,
+    snapshots: dict[str, list[dict[str, str | None]]],
+    observed_at: str,
+) -> None:
+    """Record changed, new, and removed records with system-time validity."""
+    connection.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {_quote_identifier(HISTORY_TABLE)} (
+            dataset TEXT NOT NULL,
+            record_key TEXT NOT NULL,
+            valid_from TEXT NOT NULL,
+            valid_to TEXT,
+            is_current INTEGER NOT NULL CHECK (is_current IN (0, 1)),
+            data_json TEXT NOT NULL,
+            PRIMARY KEY (dataset, record_key, valid_from),
+            CHECK (valid_to IS NULL OR valid_to > valid_from)
+        )
+        """
+    )
+    connection.execute(
+        f"""
+        CREATE INDEX IF NOT EXISTS idx_{HISTORY_TABLE}_as_of
+        ON {_quote_identifier(HISTORY_TABLE)} (dataset, record_key, valid_from, valid_to)
+        """
+    )
+
+    for dataset, rows in snapshots.items():
+        _, _, key_column = DATASETS[dataset]
+        current_rows = connection.execute(
+            f"""
+            SELECT record_key, data_json
+            FROM {_quote_identifier(HISTORY_TABLE)}
+            WHERE dataset = ? AND is_current = 1
+            """,
+            (dataset,),
+        ).fetchall()
+        current = {
+            row["record_key"]: json.loads(row["data_json"]) for row in current_rows
+        }
+        incoming = {row[key_column]: row for row in rows}
+
+        for record_key, prior_data in current.items():
+            if record_key not in incoming or incoming[record_key] != prior_data:
+                connection.execute(
+                    f"""
+                    UPDATE {_quote_identifier(HISTORY_TABLE)}
+                    SET valid_to = ?, is_current = 0
+                    WHERE dataset = ? AND record_key = ? AND is_current = 1
+                    """,
+                    (observed_at, dataset, record_key),
+                )
+
+        for record_key, row in incoming.items():
+            if current.get(record_key) != row:
+                connection.execute(
+                    f"""
+                    INSERT INTO {_quote_identifier(HISTORY_TABLE)} (
+                        dataset, record_key, valid_from, valid_to,
+                        is_current, data_json
+                    ) VALUES (?, ?, ?, NULL, 1, ?)
+                    """,
+                    (
+                        dataset,
+                        record_key,
+                        observed_at,
+                        json.dumps(row, sort_keys=True, separators=(",", ":")),
+                    ),
+                )
+
+
+def _normalize_as_of(value: str | datetime | date) -> str:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, date):
+        parsed = datetime.combine(value, datetime.min.time(), tzinfo=timezone.utc)
+    else:
+        text = value.strip()
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(
+                "as_of must be an ISO date or timestamp, for example "
+                "'2025-01-31T12:00:00Z'"
+            ) from exc
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    else:
+        parsed = parsed.astimezone(timezone.utc)
+    return parsed.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def get_record_as_of(
+    connection: sqlite3.Connection,
+    dataset: str,
+    record_key: str,
+    as_of: str | datetime | date,
+) -> dict[str, str | None] | None:
+    """Return a record's latest known version at an ingestion-time instant."""
+    if dataset not in DATASETS:
+        raise ValueError(f"Unknown dataset {dataset!r}; expected one of {sorted(DATASETS)}")
+    timestamp = _normalize_as_of(as_of)
+    row = connection.execute(
+        f"""
+        SELECT data_json
+        FROM {_quote_identifier(HISTORY_TABLE)}
+        WHERE dataset = ?
+          AND record_key = ?
+          AND valid_from <= ?
+          AND (valid_to IS NULL OR ? < valid_to)
+        ORDER BY valid_from DESC
+        LIMIT 1
+        """,
+        (dataset, record_key, timestamp, timestamp),
+    ).fetchone()
+    return json.loads(row["data_json"]) if row is not None else None
+
+
+def get_records_as_of(
+    connection: sqlite3.Connection,
+    dataset: str,
+    as_of: str | datetime | date,
+) -> list[dict[str, str | None]]:
+    """Return the full dataset snapshot known at an ingestion-time instant."""
+    if dataset not in DATASETS:
+        raise ValueError(f"Unknown dataset {dataset!r}; expected one of {sorted(DATASETS)}")
+    timestamp = _normalize_as_of(as_of)
+    rows = connection.execute(
+        f"""
+        SELECT record_key, data_json
+        FROM {_quote_identifier(HISTORY_TABLE)}
+        WHERE dataset = ?
+          AND valid_from <= ?
+          AND (valid_to IS NULL OR ? < valid_to)
+        ORDER BY record_key
+        """,
+        (dataset, timestamp, timestamp),
+    ).fetchall()
+    return [json.loads(row["data_json"]) for row in rows]
+
+
 def load_csv_data(
     connection: sqlite3.Connection, dataset_dir: str | Path
 ) -> list[LoadStats]:
@@ -271,6 +434,11 @@ def load_csv_data(
             )
             """
         )
+        observed_at = _history_observed_at(connection)
+        snapshots = {
+            dataset: rows for dataset, (_, rows, _) in prepared.items()
+        }
+        _record_snapshot_history(connection, snapshots, observed_at)
 
         for dataset, (_, table, key_column) in DATASETS.items():
             columns, rows, duplicate_count = prepared[dataset]
@@ -325,7 +493,7 @@ def load_csv_data(
                 """,
                 (
                     dataset,
-                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    observed_at,
                     serialized_columns,
                     json.dumps(added),
                     json.dumps(retained_removed),
